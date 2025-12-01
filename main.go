@@ -13,7 +13,7 @@ import (
 
 	// TODO: 请将此路径替换为您项目中编译后的 Nezha Protocol Buffer 导入路径
 	// 这是一个示例路径，您需要根据实际情况修改
-	pb "github.com/naiba/nezha/pkg/proto" 
+	pb "github.com/nezhahq/agent/proto" 
 )
 
 // --- 配置变量 (由命令行参数填充) ---
