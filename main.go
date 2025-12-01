@@ -11,18 +11,20 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 
-	// 修改为你本地 Nezha proto 的真实路径
-	pb "your/path/to/nezha/agent/proto"
+	// TODO: 请将此路径替换为您项目中编译后的 Nezha Protocol Buffer 导入路径
+	// 这是一个示例路径，您需要根据实际情况修改
+	pb "your/path/to/nezha/agent/proto" 
 )
 
-// CLI 参数
+// --- 配置变量 (由命令行参数填充) ---
 var (
 	serverAddr string
 	secret     string
 	numAgents  int
 )
 
-// --- 模拟认证 (PerRPCCredentials) ---
+// --- 1. 模拟认证凭证结构 (PerRPCCredentials) ---
+
 type AuthHandler struct {
 	ClientSecret string
 	ClientUUID   string
@@ -35,25 +37,29 @@ func (a *AuthHandler) GetRequestMetadata(ctx context.Context, uri ...string) (ma
 	}, nil
 }
 
-func (a *AuthHandler) RequireTransportSecurity() bool { return false }
+func (a *AuthHandler) RequireTransportSecurity() bool {
+	return false 
+}
 
-// --- 生成模拟机器信息 ---
+// --- 2. 模拟主机信息生成函数 ---
+
+// generateSimulatedHostInfo 模拟生成主机信息
 func generateSimulatedHostInfo(uuid string) *pb.Host {
 	return &pb.Host{
-		Platform:        fmt.Sprintf("Simulated-%s", uuid),
-		PlatformVersion: "1.0",
-		Uptime:          uint64(time.Now().Unix()),
-		Arch:            "amd64",
-		Virtualization:  "vmware",
-		Cpu: &pb.CPU{
-			Model: "Fake CPU",
+		Platform:      fmt.Sprintf("Simulated Server %s", uuid),
+		PlatformVersion: "v1.0",
+		Uptime:        uint64(time.Now().Unix()),
+		Arch:          "sim_arch", 
+		Virtualization: "vmware",
+		Cpu:           &pb.CPU{
+			Model: "Simulated CPU Model",
 			Cores: 8,
 		},
-		Mem: &pb.Mem{
-			Total: 16384 * 1024 * 1024,
+		Mem:           &pb.Mem{
+			Total: 16 * 1024 * 1024 * 1024, // 16 GB
 		},
-		Disk: &pb.Disk{
-			Total: 512 * 1024 * 1024 * 1024,
+		Disk:          &pb.Disk{
+			Total: 512 * 1024 * 1024 * 1024, // 512 GB
 		},
 		Swap: &pb.Swap{
 			Total: 4 * 1024 * 1024 * 1024,
@@ -61,78 +67,93 @@ func generateSimulatedHostInfo(uuid string) *pb.Host {
 	}
 }
 
-// --- 单个 Agent 的运行逻辑 ---
-func runSimulatedAgent(serverAddr, secret, uuid string, useTLS bool) {
-	fmt.Printf("[Agent %s] connecting to %s ...\n", uuid, serverAddr)
+// --- 3. Agent 客户端主运行逻辑 ---
 
+func runSimulatedAgent(serverAddr, secret, uuid string, useTLS bool) {
+	fmt.Printf("Agent %s: 开始连接 [%s]...\n", uuid, serverAddr)
+	
 	auth := &AuthHandler{
 		ClientSecret: secret,
 		ClientUUID:   uuid,
 	}
 
-	// gRPC Dial Options
-	var opts []grpc.DialOption
-	opts = append(opts, grpc.WithPerRPCCredentials(auth))
+	var dialOptions []grpc.DialOption
+	dialOptions = append(dialOptions, grpc.WithPerRPCCredentials(auth))
 
 	if useTLS {
-		opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(nil)))
+		dialOptions = append(dialOptions, grpc.WithTransportCredentials(credentials.NewTLS(nil))) 
 	} else {
-		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		dialOptions = append(dialOptions, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	}
-
-	// --- 使用新版 API：grpc.NewClient ---
-	conn, err := grpc.NewClient(serverAddr, opts...)
+	
+	conn, err := grpc.NewClient(serverAddr, dialOptions...)
 	if err != nil {
-		fmt.Printf("[Agent %s] connect failed: %v\n", uuid, err)
+		fmt.Printf("Agent %s [连接失败]: %v\n", uuid, err)
 		return
 	}
 	defer conn.Close()
 
 	client := pb.NewNezhaServiceClient(conn)
-
-	// 上报信息
+	
+	// --- 仅执行一次：上报主机信息 (ReportSystemInfo2) ---
+	
 	hostInfo := generateSimulatedHostInfo(uuid)
-
+	
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-
+	
 	_, err = client.ReportSystemInfo2(ctx, hostInfo)
 	if err != nil {
-		fmt.Printf("[Agent %s] report failed: %v\n", uuid, err)
-		return
+		fmt.Printf("Agent %s [上报失败]: %v\n", uuid, err)
+	} else {
+		fmt.Printf("Agent %s [上报成功]: 主机信息已发送。\n", uuid)
 	}
-
-	fmt.Printf("[Agent %s] report OK\n", uuid)
 }
 
-// --- main ---
+// --- 4. 命令行解析及运行 ---
+
 func init() {
-	flag.StringVar(&serverAddr, "ip", "", "Nezha Server address (e.g. 127.0.0.1:5555)")
-	flag.StringVar(&secret, "k", "", "Agent Secret")
-	flag.IntVar(&numAgents, "n", 1, "How many agents to simulate")
+	// 定义命令行参数
+	flag.StringVar(&serverAddr, "ip", "", "Nezha 服务器地址和端口 (e.g., 127.0.0.1:5555)")
+	flag.StringVar(&serverAddr, "ip", "", "Nezha 服务器地址和端口 (e.g., 127.0.0.1:5555)")
+	flag.StringVar(&secret, "k", "", "Nezha Agent 秘钥 (Client Secret)")
+	flag.IntVar(&numAgents, "n", 1, "模拟 Agent 的数量")
 }
 
 func main() {
 	flag.Parse()
 
+	// 验证必要参数
 	if serverAddr == "" || secret == "" {
-		fmt.Println("ERROR: -ip and -k are required.")
+		fmt.Println("❌ 错误: 必须指定服务器地址 (-ip) 和秘钥 (-k)。")
 		flag.Usage()
-		return
+		os.Exit(1)
+	}
+	if numAgents <= 0 {
+		fmt.Println("❌ 错误: 模拟 Agent 数量 (-n) 必须大于 0。")
+		os.Exit(1)
 	}
 
-	useTLS := false
-	if len(serverAddr) >= 4 && serverAddr[len(serverAddr)-4:] == ":443" {
+	fmt.Printf("✅ 开始模拟 %d 台 Agent (一次性上报)...\n", numAgents)
+	fmt.Printf("   目标服务器: %s\n", serverAddr)
+	
+	// 简单检查地址中是否包含 TLS 端口 (例如 443)，但最好通过配置明确指定
+	useTLS := false 
+	if len(serverAddr) > 0 && (serverAddr[len(serverAddr)-4:] == ":443" || serverAddr[len(serverAddr)-3:] == ":443") {
 		useTLS = true
+		fmt.Println("   警告: 检测到 443 端口，尝试使用 TLS 连接。")
 	}
-
-	fmt.Printf("Simulating %d agents ...\n", numAgents)
 
 	for i := 1; i <= numAgents; i++ {
-		uid := fmt.Sprintf("SIM-%03d", i)
-		go runSimulatedAgent(serverAddr, secret, uid, useTLS)
+		simulatedUUID := fmt.Sprintf("SIM-AGENT-%03d", i)
+		
+		// 使用 Goroutine 并发运行 Agent
+		go runSimulatedAgent(serverAddr, secret, simulatedUUID, useTLS)
 	}
 
+	// 等待足够的时间确保所有 gRPC 调用完成
+	fmt.Println("\n等待 10 秒，确保所有 Agent 完成上报并退出...")
 	time.Sleep(10 * time.Second)
-	fmt.Println("All agents finished.")
+    
+    fmt.Println("所有模拟 Agent 已完成上报。程序退出。")
 }
