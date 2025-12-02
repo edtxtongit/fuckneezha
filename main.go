@@ -2,11 +2,10 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
+	crand "crypto/rand"
 	"encoding/hex"
 	"flag"
 	"log"
-	"math/rand"
 	"time"
 
 	pb "github.com/nezhahq/agent/proto"
@@ -15,115 +14,70 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-func randomUUID() string {
-	b := make([]byte, 16)
-	rand.Read(b)
+func generateUUID() string {
+	b := make([]byte, 8)
+	_, _ = crand.Read(b)
 	return hex.EncodeToString(b)
 }
 
-func runAgent(serverAddr, secret string, id int) {
-	// 连接 Nezha 服务端
-	conn, err := grpc.Dial(serverAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+func runAgent(server, secret string) {
+	// gRPC 连接
+	conn, err := grpc.NewClient(
+		server,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
 	if err != nil {
-		log.Printf("[A-%d] dial error: %v", id, err)
+		log.Println("connect error:", err)
 		return
 	}
 	defer conn.Close()
 
 	client := pb.NewNezhaServiceClient(conn)
 
-	ctx := context.Background()
+	// 生成随机 UUID（仅代表一台主机）
+	uuid := generateUUID()
 
-	// ----------------------------
-	// 1) ReportSystemInfo (Host)
-	// ----------------------------
+	// 上报 Host 信息
 	host := &pb.Host{
-		Platform:        "linux",
-		PlatformVersion: "5.15",
-		Cpu:             []string{"Intel(R) Xeon(R)", "FakeCore"},
-		MemTotal:        2048 * 1024 * 1024,
-		DiskTotal:       20 * 1024 * 1024 * 1024,
+		Platform:        "SimulatedHost",
+		PlatformVersion: "1.0",
+		Cpu:             []string{"Fake CPU"},
+		MemTotal:        4 * 1024 * 1024 * 1024,     // 4GB
+		DiskTotal:       100 * 1024 * 1024 * 1024,   // 100GB
 		SwapTotal:       0,
 		Arch:            "amd64",
 		Virtualization:  "kvm",
-		BootTime:        uint64(time.Now().Unix() - 1000),
-		Version:         "0.0.0-sim",
+		BootTime:        uint64(time.Now().Unix()),  // 当前时间
+		Version:         uuid,                       // 用 uuid 当作“唯一识别符”
 		Gpu:             []string{},
 	}
 
-	_, err = client.ReportSystemInfo(ctx, host)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err = client.ReportSystemInfo2(ctx, host)
 	if err != nil {
-		log.Printf("[A-%d] ReportSystemInfo failed: %v", id, err)
+		log.Println("report error:", err)
 		return
 	}
 
-	log.Printf("[A-%d] Connected OK", id)
-
-	// ----------------------------
-	// 2) ReportSystemState (stream)
-	// ----------------------------
-	stream, err := client.ReportSystemState(ctx)
-	if err != nil {
-		log.Printf("[A-%d] ReportSystemState error: %v", id, err)
-		return
-	}
-
-	// 异步接收服务器响应
-	go func() {
-		for {
-			_, err := stream.Recv()
-			if err != nil {
-				return
-			}
-		}
-	}()
-
-	r := rand.New(rand.NewSource(time.Now().UnixNano() + int64(id)))
-
-	for {
-		state := &pb.State{
-			Cpu:           r.Float64() * 80,
-			MemUsed:       r.Uint64()%host.MemTotal + 100*1024*1024,
-			SwapUsed:      0,
-			DiskUsed:      r.Uint64()%host.DiskTotal + 1*1024*1024*1024,
-			NetInTransfer: r.Uint64() % 1000000,
-			NetOutTransfer:r.Uint64() % 1000000,
-			NetInSpeed:    r.Uint64() % 300000,
-			NetOutSpeed:   r.Uint64() % 300000,
-			Uptime:        uint64(time.Now().Unix() - int64(host.BootTime)),
-			Load1:         r.Float64(),
-			Load5:         r.Float64(),
-			Load15:        r.Float64(),
-			TcpConnCount:  r.Uint64() % 200,
-			UdpConnCount:  r.Uint64() % 50,
-			ProcessCount:  r.Uint64()%300 + 10,
-			Gpu:           []float64{},
-		}
-
-		err = stream.Send(state)
-		if err != nil {
-			log.Printf("[A-%d] stream send error: %v", id, err)
-			return
-		}
-
-		time.Sleep(1 * time.Second)
-	}
+	log.Printf("Sim Host %s 上报成功\n", uuid)
 }
 
 func main() {
-	server := flag.String("server", "127.0.0.1:5555", "nezha server address")
+	server := flag.String("server", "", "nezha server address (ip:port)")
 	secret := flag.String("secret", "", "agent secret")
-	count := flag.Int("count", 1, "number of agents")
+	count := flag.Int("count", 1, "number of agents to simulate")
 	flag.Parse()
 
-	if *secret == "" {
-		log.Fatal("secret cannot be empty")
+	if *server == "" || *secret == "" {
+		log.Fatal("必须指定 --server 和 --secret")
 	}
 
-	log.Printf("Starting %d agents -> %s", *count, *server)
+	log.Printf("启动模拟器: %d 个 Agent -> %s", *count, *server)
 
 	for i := 0; i < *count; i++ {
-		go runAgent(*server, *secret, i)
+		go runAgent(*server, *secret)
 	}
 
 	select {} // 永不退出
