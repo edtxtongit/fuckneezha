@@ -6,93 +6,125 @@ import (
 	"encoding/hex"
 	"flag"
 	"log"
+	"math/rand"
 	"time"
 
-	pb "github.com/nezhahq/agent/proto" // ← 修改
+	pb "github.com/nezhahq/agent/proto"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-var (
-	server = flag.String("server", "127.0.0.1:5555", "dashboard IP:PORT")
-	secret = flag.String("secret", "", "Nezha dashboard secret")
-	count  = flag.Int("n", 1, "Simulated machines number")
-)
-
 func randomUUID() string {
-	buf := make([]byte, 16)
-	rand.Read(buf)
-	return hex.EncodeToString(buf)
+	b := make([]byte, 16)
+	rand.Read(b)
+	return hex.EncodeToString(b)
 }
 
-func simulateAgent(id int) {
-	uuid := randomUUID()
-	log.Printf("[Agent %d] UUID = %s", id, uuid)
-
-	conn, err := grpc.Dial(*server,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithPerRPCCredentials(&tokenAuth{Token: *secret}),
-	)
+func runAgent(serverAddr, secret string, id int) {
+	// 连接 Nezha 服务端
+	conn, err := grpc.Dial(serverAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		log.Fatalf("connect error: %v", err)
+		log.Printf("[A-%d] dial error: %v", id, err)
+		return
 	}
 	defer conn.Close()
 
 	client := pb.NewNezhaServiceClient(conn)
 
-	// 1. ReportSystemInfo
-	_, err = client.ReportSystemInfo(context.Background(), &pb.Host{
-		Platform:         "linux",
-		PlatformVersion:  "5.10",
-		Cpu:              []string{"Intel(R) Fake CPU"},
-		MemTotal:         2048 * 1024 * 1024,
-		DiskTotal:        20 * 1024 * 1024 * 1024,
-		Arch:             "amd64",
-		Virtualization:   "kvm",
-		BootTime:         uint64(time.Now().Unix() - 1000),
-		Version:          "0.16.0",
-	})
+	ctx := context.Background()
+
+	// ----------------------------
+	// 1) ReportSystemInfo (Host)
+	// ----------------------------
+	host := &pb.Host{
+		Platform:        "linux",
+		PlatformVersion: "5.15",
+		Cpu:             []string{"Intel(R) Xeon(R)", "FakeCore"},
+		MemTotal:        2048 * 1024 * 1024,
+		DiskTotal:       20 * 1024 * 1024 * 1024,
+		SwapTotal:       0,
+		Arch:            "amd64",
+		Virtualization:  "kvm",
+		BootTime:        uint64(time.Now().Unix() - 1000),
+		Version:         "0.0.0-sim",
+		Gpu:             []string{},
+	}
+
+	_, err = client.ReportSystemInfo(ctx, host)
 	if err != nil {
-		log.Printf("[Agent %d] report info err: %v", id, err)
+		log.Printf("[A-%d] ReportSystemInfo failed: %v", id, err)
 		return
 	}
 
-	// 2. ReportSystemState (持续上报)
+	log.Printf("[A-%d] Connected OK", id)
+
+	// ----------------------------
+	// 2) ReportSystemState (stream)
+	// ----------------------------
+	stream, err := client.ReportSystemState(ctx)
+	if err != nil {
+		log.Printf("[A-%d] ReportSystemState error: %v", id, err)
+		return
+	}
+
+	// 异步接收服务器响应
 	go func() {
-		stream, _ := client.ReportSystemState(context.Background())
 		for {
-			stream.Send(&pb.State{
-				Cpu:            3.1,
-				MemUsed:        1200 * 1024 * 1024,
-				DiskUsed:       10 * 1024 * 1024 * 1024,
-				NetInSpeed:     1000,
-				NetOutSpeed:    2000,
-				Uptime:         uint64(time.Now().Unix()),
-				Load1:          0.2,
-				TcpConnCount:   10,
-				ProcessCount:   60,
-			})
-			time.Sleep(8 * time.Second)
+			_, err := stream.Recv()
+			if err != nil {
+				return
+			}
 		}
 	}()
 
-	select {}
-}
+	r := rand.New(rand.NewSource(time.Now().UnixNano() + int64(id)))
 
-type tokenAuth struct{ Token string }
+	for {
+		state := &pb.State{
+			Cpu:           r.Float64() * 80,
+			MemUsed:       r.Uint64()%host.MemTotal + 100*1024*1024,
+			SwapUsed:      0,
+			DiskUsed:      r.Uint64()%host.DiskTotal + 1*1024*1024*1024,
+			NetInTransfer: r.Uint64() % 1000000,
+			NetOutTransfer:r.Uint64() % 1000000,
+			NetInSpeed:    r.Uint64() % 300000,
+			NetOutSpeed:   r.Uint64() % 300000,
+			Uptime:        uint64(time.Now().Unix() - int64(host.BootTime)),
+			Load1:         r.Float64(),
+			Load5:         r.Float64(),
+			Load15:        r.Float64(),
+			TcpConnCount:  r.Uint64() % 200,
+			UdpConnCount:  r.Uint64() % 50,
+			ProcessCount:  r.Uint64()%300 + 10,
+			Gpu:           []float64{},
+		}
 
-func (t *tokenAuth) GetRequestMetadata(context.Context, ...string) (map[string]string, error) {
-	return map[string]string{"Token": t.Token}, nil
+		err = stream.Send(state)
+		if err != nil {
+			log.Printf("[A-%d] stream send error: %v", id, err)
+			return
+		}
+
+		time.Sleep(1 * time.Second)
+	}
 }
-func (t *tokenAuth) RequireTransportSecurity() bool { return false }
 
 func main() {
+	server := flag.String("server", "127.0.0.1:5555", "nezha server address")
+	secret := flag.String("secret", "", "agent secret")
+	count := flag.Int("count", 1, "number of agents")
 	flag.Parse()
 
-	for i := 1; i <= *count; i++ {
-		go simulateAgent(i)
+	if *secret == "" {
+		log.Fatal("secret cannot be empty")
 	}
 
-	select {}
+	log.Printf("Starting %d agents -> %s", *count, *server)
+
+	for i := 0; i < *count; i++ {
+		go runAgent(*server, *secret, i)
+	}
+
+	select {} // 永不退出
 }
