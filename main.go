@@ -2,21 +2,23 @@ package main
 
 import (
 	"context"
-	crand "crypto/rand"
-	"encoding/hex"
+	"crypto/tls"
 	"flag"
 	"log"
-	"math/rand"
 	"time"
 
 	pb "github.com/nezhahq/agent/proto"
 
+	"github.com/hashicorp/go-uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-// Auth implements PerRPCCredentials sending clientSecret + clientUUID (matches agent source)
+//
+// ----- Per-RPC Auth -----
+//
+
 type Auth struct {
 	ClientSecret string
 	ClientUUID   string
@@ -24,148 +26,118 @@ type Auth struct {
 
 func (a *Auth) GetRequestMetadata(ctx context.Context, uri ...string) (map[string]string, error) {
 	return map[string]string{
-		"clientSecret": a.ClientSecret,
-		"clientUUID":   a.ClientUUID,
+		"client_secret": a.ClientSecret,
+		"client_uuid":   a.ClientUUID,
 	}, nil
 }
 
 func (a *Auth) RequireTransportSecurity() bool {
-	// original agent returns false; keep false to allow insecure testing.
-	// If you run in production with TLS, pass --tls and server will accept secure transport.
 	return false
 }
 
 func genUUID() string {
-	b := make([]byte, 8)
-	_, _ = crand.Read(b)
-	return hex.EncodeToString(b)
+	id, _ := uuid.GenerateUUID()
+	return id
 }
 
-func runAgent(server string, secret string, idx int, useTLS bool) {
-	uuid := genUUID()
-	auth := &Auth{
-		ClientSecret: secret,
-		ClientUUID:   uuid,
-	}
+//
+// ----- Single-Shot Agent（只上报一次） -----
+//
 
-	// choose transport credentials
+func runAgent(server, secret string, idx int, useTLS bool) {
+	uuid := genUUID()
+	auth := &Auth{ClientSecret: secret, ClientUUID: uuid}
+
+	// 连接
 	var transport grpc.DialOption
 	if useTLS {
-		transport = grpc.WithTransportCredentials(credentials.NewTLS(nil))
+		transport = grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12}))
 	} else {
 		transport = grpc.WithTransportCredentials(insecure.NewCredentials())
 	}
 
-	// dial with per-RPC creds
-	ctxDial, cancelDial := context.WithTimeout(context.Background(), 8*time.Second)
-	defer cancelDial()
-
-	conn, err := grpc.DialContext(ctxDial, server,
+	conn, err := grpc.Dial(server,
 		transport,
-		grpc.WithPerRPCCredentials(auth),
 		grpc.WithBlock(),
+		grpc.WithPerRPCCredentials(auth),
+		grpc.FailOnNonTempDialError(true),
+		grpc.WithTimeout(10*time.Second),
 	)
 	if err != nil {
-		log.Printf("[A-%d][%s] dial error: %v", idx, uuid, err)
+		log.Printf("[A-%d] dial err: %v", idx, err)
 		return
 	}
 	defer conn.Close()
 
 	client := pb.NewNezhaServiceClient(conn)
 
-	// also include uuid in outgoing ctx metadata for compatibility
-	ctx := context.Background()
-	ctx = context.WithValue(ctx, "uuid", uuid) // not used by gRPC metadata but kept for clarity
+	// ---- ReportSystemInfo2（只上报一次） ----
 
-	// Build Host per proto you provided; Version field uses uuid for uniqueness
 	host := &pb.Host{
 		Platform:        "linux",
 		PlatformVersion: "5.15",
-		Cpu:             []string{"FakeCPU"},
+		Cpu:             []string{"Fake-CPU"},
 		MemTotal:        4 * 1024 * 1024 * 1024,
-		DiskTotal:       100 * 1024 * 1024 * 1024,
-		SwapTotal:       0,
+		DiskTotal:       50 * 1024 * 1024 * 1024,
 		Arch:            "amd64",
 		Virtualization:  "kvm",
 		BootTime:        uint64(time.Now().Unix()),
-		Version:         uuid, // keep uuid visible in host record
-		Gpu:             []string{},
+		Version:         "1.14.9-single",
 	}
 
-	// call ReportSystemInfo2 (one-shot)
-	callCtx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
-	_, err = client.ReportSystemInfo2(callCtx, host)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	_, err = client.ReportSystemInfo2(ctx, host)
 	cancel()
 	if err != nil {
-		log.Printf("[A-%d][%s] ReportSystemInfo2 err: %v", idx, uuid, err)
+		log.Printf("[A-%d] ReportSystemInfo2 err: %v", idx, err)
 		return
 	}
-	log.Printf("[A-%d][%s] ReportSystemInfo2 OK", idx, uuid)
 
-	// open ReportSystemState stream and send periodic State (1s)
-	stateCtx, stateCancel := context.WithCancel(context.Background())
-	defer stateCancel()
+	// ---- ReportSystemState 流（只发送一次） ----
 
-	stream, err := client.ReportSystemState(stateCtx)
+	stream, err := client.ReportSystemState(context.Background())
 	if err != nil {
-		log.Printf("[A-%d][%s] ReportSystemState open err: %v", idx, uuid, err)
+		log.Printf("[A-%d] open stream err: %v", idx, err)
 		return
 	}
 
-	// receive goroutine to drain Receipts (server might send receipts)
-	go func() {
-		for {
-			_, err := stream.Recv()
-			if err != nil {
-				// stream closed or error; exit receive loop
-				return
-			}
-		}
-	}()
-
-	// deterministic-ish slight jitter for each agent
-	r := rand.New(rand.NewSource(time.Now().UnixNano() + int64(idx)))
-
-	for {
-		state := &pb.State{
-			Cpu:            r.Float64() * 10, // small values to reduce server load
-			MemUsed:        512 * 1024 * 1024,
-			SwapUsed:       0,
-			DiskUsed:       10 * 1024 * 1024 * 1024,
-			NetInTransfer:  0,
-			NetOutTransfer: 0,
-			NetInSpeed:     0,
-			NetOutSpeed:    0,
-			Uptime:         uint64(time.Now().Unix()),
-			Load1:          r.Float64(),
-			Load5:          r.Float64(),
-			Load15:         r.Float64(),
-			TcpConnCount:   1,
-			UdpConnCount:   0,
-			ProcessCount:   20,
-			Gpu:            []float64{},
-		}
-
-		if err := stream.Send(state); err != nil {
-			log.Printf("[A-%d][%s] state send err: %v", idx, uuid, err)
-			return
-		}
-		time.Sleep(1 * time.Second)
+	state := &pb.State{
+		Cpu:          1.5,
+		MemUsed:      512 * 1024 * 1024,
+		Load1:        0.2,
+		Load5:        0.1,
+		Load15:       0.05,
+		ProcessCount: 20,
+		Uptime:       uint64(time.Now().Unix()),
 	}
+
+	if err := stream.Send(state); err != nil {
+		log.Printf("[A-%d] state send err: %v", idx, err)
+		return
+	}
+
+	// 发送完成后立即 CloseSend
+	stream.CloseSend()
+
+	log.Printf("[A-%d][%s] 完成一次认证 + 一次上报", idx, uuid)
 }
 
+//
+// ----- Main -----
+//
+
 func main() {
-	server := flag.String("server", "", "nezha server address host:port (required)")
-	secret := flag.String("secret", "", "client secret / clientSecret (required)")
-	count := flag.Int("count", 1, "number of agents to simulate")
-	tlsFlag := flag.Bool("tls", false, "use TLS for gRPC (default false)")
+	server := flag.String("server", "", "x.x.x.x:5555")
+	secret := flag.String("secret", "", "agent secret")
+	count := flag.Int("count", 1, "spawn N agents")
+	tlsFlag := flag.Bool("tls", false, "use TLS")
 	flag.Parse()
 
 	if *server == "" || *secret == "" {
-		log.Fatal("--server and --secret are required")
+		log.Fatal("--server --secret 必须填写")
 	}
 
-	log.Printf("Starting %d agents -> %s (tls=%v)\n", *count, *server, *tlsFlag)
+	log.Printf("启动 %d 个一次性 agent\n", *count)
 
 	for i := 0; i < *count; i++ {
 		go runAgent(*server, *secret, i, *tlsFlag)
