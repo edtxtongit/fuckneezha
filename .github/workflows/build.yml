@@ -11,29 +11,31 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Setup Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: "1.22"
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
 
-    - name: Verify go.mod
-      run: |
-        if [ ! -f go.mod ]; then
-          echo "go.mod not found! Creating one..."
-          go mod init nezha-simulator
-        fi
-        go mod tidy
+      - name: Verify go.mod
+        run: |
+          if [ ! -f go.mod ]; then
+            echo "go.mod not found! Creating one..."
+            go mod init nezha-simulator
+          fi
+          go mod tidy
 
-    - name: Build binary
-      run: |
-        mkdir -p build
-        go build -o build/nezha-simulator main.go
+      - name: Build static binary (Linux x86_64)
+        run: |
+          mkdir -p build
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -trimpath -ldflags="-s -w -extldflags '-static'" \
+            -o build/nezha-simulator main.go
 
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: nezha-simulator
-        path: build/nezha-simulator
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nezha-simulator
+          path: build/nezha-simulator
